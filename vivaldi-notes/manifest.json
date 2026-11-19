@@ -1,0 +1,11 @@
+{
+  "manifest_version": 3,
+  "name": "QuickMemo",
+  "version": "0.1.0",
+  "description": "Chrome のサイドパネルで Markdown メモを書き、選んだフォルダに保存する。",
+  "minimum_chrome_version": "116",
+  "permissions": ["sidePanel", "contextMenus", "storage", "unlimitedStorage"],
+  "action": { "default_title": "QuickMemoを開く" },
+  "side_panel": { "default_path": "sidepanel.html" },
+  "background": { "service_worker": "background.js", "type": "module" }
+}

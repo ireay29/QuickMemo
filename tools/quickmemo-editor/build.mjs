@@ -4,7 +4,7 @@ import { fileURLToPath } from 'node:url';
 import { build } from 'esbuild';
 
 const project = fileURLToPath(new URL('.', import.meta.url));
-const output = process.argv[2] ?? fileURLToPath(new URL('../../vivaldi-notes/vendor/', import.meta.url));
+const output = process.argv[2] ?? fileURLToPath(new URL('../../quickmemo/vendor/', import.meta.url));
 const bundle = await build({
   absWorkingDir: project,
   entryPoints: ['exports.js'],

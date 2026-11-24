@@ -3,8 +3,11 @@ import { collectionFolders, noteArea, noteFolderLimit, originalPath } from './no
 
 const folderKey = 'active-folder';
 const knownFoldersKey = 'known-folders';
+const activeFolderIdKey = 'active-folder-id';
+const folderRecordPrefix = 'known-folder:';
+const folderTimeout = 5_000;
 export const readWrite = { mode: 'readwrite' };
-export const withFilesLock = (task) => navigator.locks.request('side-notes-files', task);
+export const withFilesLock = (task, options = {}) => navigator.locks.request('side-notes-files', options, task);
 const unreadableEntries = new Set(['NotFoundError', 'NotAllowedError', 'SecurityError', 'NotReadableError']);
 
 async function transactionFor(storeName, mode, action) {
@@ -21,8 +24,14 @@ async function transactionFor(storeName, mode, action) {
     return await new Promise((resolve, reject) => {
       const transaction = db.transaction(storeName, mode);
       const request = action(transaction.objectStore(storeName));
-      transaction.oncomplete = () => resolve(request.result);
-      transaction.onabort = () => reject(transaction.error);
+      transaction.oncomplete = () => {
+        try {
+          resolve(request.result);
+        } catch (error) {
+          reject(error);
+        }
+      };
+      transaction.onabort = () => reject(transaction.error ?? new Error('Chrome 内のデータを読み書きできませんでした。'));
     });
   } finally {
     db.close();
@@ -36,37 +45,104 @@ export const getDrafts = () => draftStore('readonly', (store) => store.getAll())
 export const putDraft = (draft) => draftStore('readwrite', (store) => store.put(draft));
 export const removeDraft = (id) => draftStore('readwrite', (store) => store.delete(id));
 
-export function getFolder() {
-  return folderStore('readonly', (store) => store.get(folderKey));
+function withFolderDeadline(operation, errorMessage, errorName) {
+  let timer;
+  const deadline = new Promise((_, reject) => {
+    timer = setTimeout(() => {
+      const error = new Error(errorMessage);
+      error.name = errorName;
+      reject(error);
+    }, folderTimeout);
+  });
+  return Promise.race([operation, deadline]).finally(() => clearTimeout(timer));
+}
+
+function waitForFolder(operation) {
+  return withFolderDeadline(operation,
+    '保存先の確認に時間がかかっています。設定タブで保存先を選び直してください。', 'FolderCheckTimeout');
+}
+
+function waitForScan(operation) {
+  return withFolderDeadline(operation,
+    'フォルダの読み込みに時間がかかっています。フォルダへのアクセスを確認してから、もう一度お試しください。', 'FolderScanTimeout');
+}
+
+function readFolderSetting(key) {
+  return waitForFolder(folderStore('readonly', (store) => store.get(key)));
+}
+
+function readFolderCandidate(key) {
+  return readFolderSetting(key).catch((error) => {
+    if (!['DataCloneError', 'AbortError', 'FolderCheckTimeout'].includes(error.name)) throw error;
+  });
+}
+
+const folderRecordKey = (id) => `${folderRecordPrefix}${id}`;
+
+export function matchesFolderId(folder, id) {
+  return Boolean(folder && (folder.id === id || folder.previousIds?.includes(id)));
+}
+
+export async function getFolder(preferred) {
+  const id = await readFolderSetting(activeFolderIdKey);
+  if (id !== undefined && id === preferred?.id) return preferred;
+  return readFolderSetting(id === undefined ? folderKey : folderRecordKey(id));
+}
+
+export async function hasFolderAccess(folder) {
+  return Boolean(folder && await waitForFolder(folder.handle.queryPermission(readWrite)) === 'granted');
+}
+
+async function folderCandidates() {
+  const range = IDBKeyRange.bound(folderRecordPrefix, `${folderRecordPrefix}\uffff`);
+  const [keys, legacy, legacyActive] = await Promise.all([
+    waitForFolder(folderStore('readonly', (store) => store.getAllKeys(range))),
+    readFolderCandidate(knownFoldersKey),
+    readFolderCandidate(folderKey),
+  ]);
+  const records = await Promise.all(keys.map(readFolderCandidate));
+  // A legacy handle can still work when the newer record for the same ID fails.
+  return [...(legacy ?? []), legacyActive, ...records].filter(Boolean);
 }
 
 export function rememberFolder(handle) {
   return withFilesLock(async () => {
-    const known = await folderStore('readonly', (store) => store.get(knownFoldersKey)) ?? [];
-    const active = await getFolder();
-    if (active && !known.some((folder) => folder.id === active.id)) known.push(active);
-    let id;
-    for (const candidate of known) {
-      if (await handle.isSameEntry(candidate.handle)) {
-        id = candidate.id;
-        break;
-      }
+    const candidates = await folderCandidates();
+    const matches = await Promise.all(candidates.map((candidate) =>
+      waitForFolder(handle.isSameEntry(candidate.handle)).catch((error) => {
+        if (error.name !== 'AbortError' && error.name !== 'FolderCheckTimeout') throw error;
+        return null;
+      })));
+    // A stale record can fail comparison even after Chrome returns a new handle.
+    if (matches.includes(null) && !await waitForFolder(handle.isSameEntry(handle))) {
+      throw new Error('Chrome から有効な保存先を取得できませんでした。');
     }
-    const folder = { id: id ?? crypto.randomUUID(), handle };
+    const equivalentIds = new Set();
+    for (const [index, candidate] of candidates.entries()) {
+      if (!matches[index]) continue;
+      equivalentIds.add(candidate.id);
+      for (const id of candidate.previousIds ?? []) equivalentIds.add(id);
+    }
+    const [id = crypto.randomUUID(), ...previousIds] = equivalentIds;
+    const folder = { id, handle, previousIds };
     await folderStore('readwrite', (store) => {
-      store.put([...known.filter((item) => item.id !== folder.id), folder], knownFoldersKey);
-      return store.put(folder, folderKey);
+      // Only serialize the new handle. Older handles remain available for future matching.
+      store.put(folder, folderRecordKey(folder.id));
+      return store.put(folder.id, activeFolderIdKey);
     });
     return folder;
+  }, { signal: AbortSignal.timeout(folderTimeout) }).catch((error) => {
+    if (error.name !== 'TimeoutError') throw error;
+    throw new Error('別の処理が保存先を使っています。少し待ってから選び直してください。');
   });
 }
 
 export async function requireFolder(id) {
   const folder = await getFolder();
-  if (!folder || (id && folder.id !== id) ||
-      await folder.handle.queryPermission(readWrite) !== 'granted') {
+  if (!folder || (id && !matchesFolderId(folder, id))) {
     throw new Error('保存先フォルダを開き直してください。');
   }
+  // Chrome checks the handle's permissions when each file operation runs.
   return folder.handle;
 }
 
@@ -84,7 +160,11 @@ export async function scanFolder(root) {
   const folders = [[]];
   const skipped = [];
   async function scan(dir, folder) {
-    for await (const [name, handle] of dir.entries()) {
+    const entries = dir.entries();
+    while (true) {
+      const entry = await waitForScan(entries.next());
+      if (entry.done) break;
+      const [name, handle] = entry.value;
       const path = [...folder, name];
       try {
         if (handle.kind === 'directory') {
@@ -95,7 +175,7 @@ export async function scanFolder(root) {
           await scan(handle, path);
           folders.push(path);
         } else if (/\.md$/i.test(name)) {
-          const raw = await readFile(handle);
+          const raw = await waitForScan(readFile(handle));
           notes.push({ folder, name, path, raw, ...readMarkdown(raw, name) });
         }
       } catch (error) {

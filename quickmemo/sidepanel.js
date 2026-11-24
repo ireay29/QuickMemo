@@ -1,5 +1,5 @@
 import {
-  addFiles, directoryAt, getDraft, getDrafts, getFolder, noteFilename, organizeNote, putDraft, readWrite,
+  addFiles, directoryAt, getDraft, getDrafts, getFolder, hasFolderAccess, matchesFolderId, noteFilename, organizeNote, putDraft, readWrite,
   rememberFolder, removeDraft, requireFolder, scanFolder, withFilesLock,
 } from './files.js';
 import { readBackup, readMarkdown, readVivaldi, safeName, writeMarkdown } from './markdown.js';
@@ -19,6 +19,7 @@ const dialog = element('folder-dialog');
 const purgeDialog = element('purge-dialog');
 const viewButtons = element('note-views').querySelectorAll('button');
 const pickerOptions = { id: 'side-notes-folder', startIn: 'documents', mode: 'readwrite' };
+const listLockTimeout = 8_000;
 const folderActions = [
   'new-note', 'new-folder', 'reload', 'import-markdown', 'import-vivaldi', 'export-backup', 'import-backup',
 ];
@@ -36,6 +37,8 @@ let editor;
 let busy = false;
 let clipsChanged = false;
 let settingsChange;
+let settingsRestore;
+const authorizingFolders = new Set();
 let jsonReader;
 let view = 'active';
 let pendingPurge;
@@ -68,14 +71,13 @@ function updateControls() {
   folderSelect.disabled = busy || !canWrite;
   search.disabled = busy || !canWrite;
   element('choose-folder').disabled = busy;
-  element('open-settings').disabled = busy;
   element('authorize-folder').hidden = !folder || canWrite;
-  element('authorize-folder').disabled = busy;
+  element('authorize-folder').disabled = busy || authorizingFolders.has(folder?.id);
   const libraryName = element('library-name');
   libraryName.textContent = folder?.handle.name || '保存先未設定';
   libraryName.title = libraryName.textContent;
   for (const field of Object.values(inputs)) field.readOnly = busy || editor?.area !== 'active';
-  element('retry-save').disabled = busy || !canWrite || editor?.area !== 'active' || editor.folderId !== folder?.id;
+  element('retry-save').disabled = busy || !canWrite || editor?.area !== 'active' || !matchesFolderId(folder, editor.folderId);
   element('save-copy').disabled = busy || !canWrite;
   element('download-draft').disabled = busy;
   element('close-draft').disabled = busy;
@@ -88,14 +90,14 @@ function updateControls() {
   };
   for (const [id, visible] of Object.entries(actions)) {
     element(id).hidden = !visible || editor.failed;
-    element(id).disabled = busy || !canWrite || editor?.folderId !== folder?.id;
+    element(id).disabled = busy || !canWrite || !matchesFolderId(folder, editor?.folderId);
   }
   updateSelectionControls();
 }
 
 async function updateFolderAccess() {
   const current = folder;
-  const granted = Boolean(current && await current.handle.queryPermission(readWrite) === 'granted');
+  const granted = await hasFolderAccess(current);
   if (folder !== current) return;
   canWrite = granted;
   updateControls();
@@ -109,10 +111,8 @@ async function run(task) {
   try {
     await task();
   } catch (error) {
-    if (error.name !== 'AbortError') {
-      message(errorText(error));
-      await updateFolderAccess().catch(console.error);
-    }
+    message(errorText(error));
+    if (canWrite) await updateFolderAccess().catch(console.error);
   } finally {
     busy = false;
     updateControls();
@@ -120,6 +120,12 @@ async function run(task) {
     updateDraftList().catch(console.error);
     applySettingsChange();
   }
+}
+
+function pickerResult(pending) {
+  return pending.catch((error) => {
+    if (error.name !== 'AbortError') throw error;
+  });
 }
 
 function selectedFolder() {
@@ -211,7 +217,7 @@ function renderNotes() {
     const button = document.createElement('button');
     button.type = 'button';
     button.className = 'note-row';
-    const isCurrent = editor?.folderId === folder?.id && pathKey(note.path) === editor?.key;
+    const isCurrent = matchesFolderId(folder, editor?.folderId) && pathKey(note.path) === editor?.key;
     button.setAttribute('aria-current', String(isCurrent));
     button.append(...labels);
     button.addEventListener('click', () => run(async () => {
@@ -347,7 +353,13 @@ function skippedWarning(skipped) {
 
 async function refresh({ resetEditor = false, selectPath } = {}) {
   if (!canWrite) return;
-  const data = await withFilesLock(async () => scanFolder(await requireFolder(folder.id)));
+  const current = folder;
+  const data = await withFilesLock(() => scanFolder(current.handle), { signal: AbortSignal.timeout(listLockTimeout) })
+    .catch((error) => {
+      if (error.name !== 'TimeoutError') throw error;
+      throw new Error('別の保存処理が終わるまでメモ一覧を読み込めません。少し待ってから再読み込みしてください。');
+    });
+  if (folder !== current) return;
   notes = data.notes;
   folders = data.folders;
   const warning = element('scan-warning');
@@ -356,7 +368,7 @@ async function refresh({ resetEditor = false, selectPath } = {}) {
   if (resetEditor || selectPath) {
     const key = selectPath ? pathKey(selectPath) : editor?.key;
     openNote(notes.find((note) => pathKey(note.path) === key));
-  } else if (editor && editor.folderId === folder.id && !editor.failed && !editor.pending.size &&
+  } else if (editor && matchesFolderId(folder, editor.folderId) && !editor.failed && !editor.pending.size &&
       !notes.some((note) => pathKey(note.path) === editor.key)) {
     inputs.body.flush();
     if (!editor.pending.size) {
@@ -368,8 +380,28 @@ async function refresh({ resetEditor = false, selectPath } = {}) {
   renderNotes();
 }
 
-async function openFolder() {
-  canWrite = Boolean(folder && await folder.handle.queryPermission(readWrite) === 'granted');
+async function flushFolderClips() {
+  const current = folder;
+  let status;
+  try {
+    const result = await worker({ type: 'flush-clips' });
+    if (result) status = `保留中のクリップを${result}件保存しました。`;
+  } catch (error) {
+    status = errorText(error);
+  }
+  if (!status || folder !== current) return;
+  if (busy || element('notice').textContent) return;
+  message(status);
+}
+
+async function openFolder(accessJustGranted = false) {
+  canWrite = false;
+  canWrite = accessJustGranted || await hasFolderAccess(folder);
+  message(folder && !canWrite ? 'Chromeでフォルダへのアクセスを許可してください。' : '');
+  if (settingsPage) {
+    if (canWrite) void flushFolderClips();
+    return;
+  }
   folders = [];
   notes = [];
   selecting = false;
@@ -382,14 +414,44 @@ async function openFolder() {
   renderFolders();
   renderNotes();
   if (canWrite) {
-    const result = await worker({ type: 'flush-clips' }).catch((error) => {
-      message(errorText(error));
-      return 0;
-    });
-    if (result) message(`保留中のクリップを${result}件保存しました。`);
+    message('メモ一覧を読み込んでいます…');
     await refresh();
-  } else if (folder) {
-    message('Chromeでフォルダへのアクセスを許可してください。');
+    message();
+    void flushFolderClips();
+  }
+}
+
+async function restoreFolder(preferred) {
+  canWrite = false;
+  message('保存先を確認しています…');
+  const saved = await getFolder(preferred);
+  const hasFreshAccess = Boolean(preferred && preferred.id === saved?.id);
+  folder = hasFreshAccess ? preferred : saved;
+  await openFolder(hasFreshAccess);
+}
+
+async function restoreSettingsFolder() {
+  folder = undefined;
+  canWrite = false;
+  message('保存先を確認しています…');
+  updateControls();
+  const pending = getFolder().then(async (current) => ({ current, granted: await hasFolderAccess(current) }));
+  settingsRestore = pending;
+  try {
+    const { current, granted } = await pending;
+    if (settingsRestore !== pending) return;
+    folder = current;
+    canWrite = granted;
+    message(folder && !canWrite ? 'Chromeでフォルダへのアクセスを許可してください。' : '');
+    if (canWrite) void flushFolderClips();
+  } catch (error) {
+    if (settingsRestore === pending) message(errorText(error));
+  } finally {
+    if (settingsRestore === pending) {
+      settingsRestore = undefined;
+      updateControls();
+      updateClips().catch(console.error);
+    }
   }
 }
 
@@ -398,7 +460,7 @@ async function updateClips() {
     chrome.storage.local.get(null), chrome.storage.session.get('clip-save-error'),
   ]);
   const clips = Object.entries(pending).filter(([key]) => key.startsWith('clip:')).map(([, clip]) => clip);
-  const elsewhere = clips.filter((clip) => clip.folderId && clip.folderId !== folder?.id).length;
+  const elsewhere = clips.filter((clip) => clip.folderId && !matchesFolderId(folder, clip.folderId)).length;
   const here = clips.length - elsewhere;
   const label = element('clip-count');
   const failed = errors['clip-save-error'];
@@ -434,7 +496,7 @@ async function createNote({ copy = false } = {}) {
   const note = copy ? {
     ...previous, ...editorFields(previous), lastmod: now,
   } : { title: '無題', body: '', url: '', date: now, lastmod: now };
-  const sameFolder = copy && original.folderId === folder.id;
+  const sameFolder = copy && matchesFolderId(folder, original.folderId);
   const parts = sameFolder && original.area === 'active' &&
       folders.some((path) => pathKey(path) === pathKey(original.path.slice(0, -1)))
     ? original.path.slice(0, -1) : selectedFolder();
@@ -465,7 +527,7 @@ async function importEntries(entries, skipped = []) {
 }
 
 async function performNoteAction(action, target) {
-  if (!target || editor !== target || target.folderId !== folder?.id) {
+  if (!target || editor !== target || !matchesFolderId(folder, target.folderId)) {
     message('メモの選択が変わりました。対象を選び直してください。');
     return false;
   }
@@ -550,10 +612,17 @@ async function organizeSelection({ action, folderId, area, targets }) {
   if (processed) element('selection-mode').focus();
 }
 
-function openSettings() {
-  return run(async () => {
+async function openSettings() {
+  const button = element('open-settings');
+  if (button.disabled) return;
+  button.disabled = true;
+  try {
     await chrome.tabs.create({ url: chrome.runtime.getURL('sidepanel.html?settings') });
-  });
+  } catch (error) {
+    message(errorText(error));
+  } finally {
+    button.disabled = false;
+  }
 }
 
 element('open-settings').addEventListener('click', openSettings);
@@ -563,38 +632,52 @@ element('close-settings').addEventListener('click', async () => {
 });
 
 element('choose-folder').addEventListener('click', () => run(async () => {
-  const handle = await window.showDirectoryPicker(pickerOptions);
+  const handle = await pickerResult(window.showDirectoryPicker(pickerOptions));
+  if (!handle) return;
+  settingsRestore = undefined;
   await settleEditor();
-  folder = await rememberFolder(handle);
-  folderEvents.postMessage('folder');
-  await openFolder();
+  try {
+    folder = await rememberFolder(handle);
+  } catch (error) {
+    throw new Error(`選んだフォルダを登録できませんでした。${errorText(error)}`, { cause: error });
+  }
+  notifyFolderChange(folder);
+  await openFolder(true);
 }));
 
-element('authorize-folder').addEventListener('click', () => {
-  return run(async () => {
-    let permission;
-    try {
-      permission = await folder.handle.requestPermission(readWrite);
-    } catch (error) {
-      if (settingsPage || error.name === 'AbortError') throw error;
-      message('設定タブからアクセスを許可してください。');
+element('authorize-folder').addEventListener('click', async () => {
+  if (!settingsPage) {
+    await openSettings();
+    return;
+  }
+  const current = folder;
+  if (!current || authorizingFolders.has(current.id) || busy) return;
+  authorizingFolders.add(current.id);
+  message('Chromeのダイアログでフォルダへのアクセスを許可してください。');
+  updateControls();
+  try {
+    const permission = await current.handle.requestPermission(readWrite);
+    if (folder !== current) return;
+    if (permission !== 'granted') {
+      if (!busy) message('フォルダへのアクセスが許可されませんでした。');
       return;
     }
-    if (permission !== 'granted' && !settingsPage) {
-      message('設定タブからアクセスを許可してください。');
-      return;
-    }
-    folderEvents.postMessage('folder');
-    await flushEditor();
-    await openFolder();
-  });
+    notifyFolderChange(current);
+    settingsChange ??= { type: 'folder', current, localGrant: true };
+    applySettingsChange();
+  } catch (error) {
+    if (folder === current && !busy) message(error.name === 'AbortError' ? '' : errorText(error));
+  } finally {
+    authorizingFolders.delete(current.id);
+    updateControls();
+  }
 });
 
 element('reload').addEventListener('click', () => run(async () => {
   await settleEditor();
-  await worker({ type: 'flush-clips' });
   await refresh({ resetEditor: true });
   message('保存先を読み直しました。');
+  void flushFolderClips();
 }));
 
 element('new-note').addEventListener('click', async () => {
@@ -755,7 +838,8 @@ element('close-draft').addEventListener('click', () => run(async () => {
 }));
 
 element('import-markdown').addEventListener('click', () => run(async () => {
-  const source = await window.showDirectoryPicker({ id: 'import-notes', startIn: 'documents' });
+  const source = await pickerResult(window.showDirectoryPicker({ id: 'import-notes', startIn: 'documents' }));
+  if (!source) return;
   if (await source.resolve(folder.handle) !== null || await folder.handle.resolve(source) !== null) {
     throw new Error('取り込み元と保存先が重ならないフォルダを選んでください。');
   }
@@ -788,10 +872,11 @@ element('import-vivaldi').addEventListener('click', () => chooseJson(readVivaldi
 element('import-backup').addEventListener('click', () => chooseJson(readBackup));
 
 element('export-backup').addEventListener('click', () => run(async () => {
-  const handle = await window.showSaveFilePicker({
+  const handle = await pickerResult(window.showSaveFilePicker({
     suggestedName: `side-notes-${new Date().toISOString().slice(0, 10)}.json`,
     types: [{ description: 'JSON バックアップ', accept: { 'application/json': ['.json'] } }],
-  });
+  }));
+  if (!handle) return;
   await settleEditor();
   await refresh();
   const files = notes.map((note) => ({ path: note.path, markdown: note.raw }));
@@ -817,16 +902,35 @@ chrome.storage.onChanged.addListener((changes, area) => {
   updateClips().catch(console.error);
 });
 
+function notifyFolderChange(current) {
+  try {
+    folderEvents.postMessage({ type: 'folder', current });
+  } catch {
+    folderEvents.postMessage('folder');
+  }
+}
+
 function applySettingsChange() {
   if (busy || purgeDialog.open || !settingsChange) return;
   const changed = settingsChange;
   settingsChange = null;
+  if (settingsPage) {
+    if (changed.localGrant) {
+      if (changed.current !== folder) return;
+      canWrite = true;
+      updateControls();
+      message();
+      void flushFolderClips();
+      return;
+    }
+    void restoreSettingsFolder();
+    return;
+  }
   run(async () => {
     await flushEditor();
-    if (changed === 'folder') {
-      folder = await getFolder();
-      await openFolder();
-      if (editor?.failed && editor.folderId !== folder?.id) {
+    if (changed.type === 'folder') {
+      await restoreFolder(changed.current);
+      if (editor?.failed && !matchesFolderId(folder, editor.folderId)) {
         showSaveState('保存先が変わりました。「コピーを保存」で編集中の内容を残せます。', true);
       }
     } else {
@@ -836,7 +940,10 @@ function applySettingsChange() {
 }
 
 folderEvents.addEventListener('message', ({ data }) => {
-  if (settingsChange !== 'folder') settingsChange = data;
+  const changed = typeof data === 'string' ? { type: data } : data;
+  if (!changed || (changed.type !== 'folder' && changed.type !== 'files')) return;
+  if (settingsPage && changed.type === 'files') return;
+  if (settingsChange?.type !== 'folder' || changed.type === 'folder') settingsChange = changed;
   applySettingsChange();
 });
 
@@ -846,9 +953,7 @@ if (settingsPage) {
   document.querySelector('main').hidden = true;
   for (const id of ['new-note', 'open-settings', 'reload']) element(id).hidden = true;
   for (const id of ['close-settings', 'file-actions', 'folder-help']) element(id).hidden = false;
+  void restoreSettingsFolder();
+} else {
+  run(restoreFolder);
 }
-
-run(async () => {
-  folder = await getFolder();
-  await openFolder();
-});

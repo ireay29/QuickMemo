@@ -1,4 +1,4 @@
-import { addFiles, getDraft, getFolder, organizeNote, putDraft, removeDraft, requireFolder, saveNote, withFilesLock } from './files.js';
+import { addFiles, getDraft, getFolder, matchesFolderId, organizeNote, putDraft, removeDraft, requireFolder, saveNote, withFilesLock } from './files.js';
 import { readMarkdown, titleFromText, writeMarkdown } from './markdown.js';
 
 const clipKey = 'clip:';
@@ -38,13 +38,15 @@ async function saveSelection(info) {
   await flushClips().catch(() => {});
 }
 
-function flushClips() {
+async function flushClips() {
+  const queued = await chrome.storage.local.get(null);
+  if (!Object.keys(queued).some((key) => key.startsWith(clipKey))) return 0;
   return withFilesLock(async () => {
     const storage = await chrome.storage.local.get(null);
     const folder = await getFolder();
     if (!folder) return 0;
     const pending = Object.entries(storage).filter(([key, clip]) =>
-      key.startsWith(clipKey) && (!clip.folderId || clip.folderId === folder.id));
+      key.startsWith(clipKey) && (!clip.folderId || matchesFolderId(folder, clip.folderId)));
     if (!pending.length) return 0;
     const unassigned = Object.fromEntries(pending.filter(([, clip]) => !clip.folderId)
       .map(([key, clip]) => [key, { ...clip, folderId: folder.id }]));
